@@ -576,7 +576,7 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 				return nil, fmt.Errorf("Dolt server auto-started but still unreachable at %s: %w\n\n"+
 					"Check logs: %s", addr, dialErr, doltserver.LogPath(beadsDir))
 			}
-		} else if doltserver.IsDaemonManaged() {
+		} else if os.Getenv("BEADS_TEST_MODE") == "" && doltserver.IsDaemonManaged() {
 			// Gas Town detected (GT_ROOT or filesystem heuristic) — delegate
 			// server start to gt, which manages the lifecycle properly.
 			gtBin, lookErr := exec.LookPath("gt")
