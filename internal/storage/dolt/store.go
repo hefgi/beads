@@ -72,6 +72,7 @@ func isTestDatabaseName(name string) bool {
 type DoltStore struct {
 	db       *sql.DB
 	dbPath   string       // Path to Dolt database directory
+	encKey   []byte       // Cached AES-256 encryption key (loaded from .encryption_key file)
 	closed   atomic.Bool  // Tracks whether Close() has been called
 	connStr  string       // Connection string for reconnection
 	mu       sync.RWMutex // Protects concurrent access
@@ -674,6 +675,15 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			return nil
 		}, backoff.WithContext(schemaBO, ctx)); err != nil {
 			return nil, fmt.Errorf("failed to initialize schema: %w", err)
+		}
+	}
+
+	// Migrate encryption key from legacy path-derived to random key file.
+	// Best-effort: migration failure should not prevent store from opening,
+	// but new credential operations will use the secure random key.
+	if !cfg.ReadOnly {
+		if err := store.migrateEncryptionKey(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: encryption key migration failed: %v\n", err)
 		}
 	}
 

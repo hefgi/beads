@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -41,24 +42,143 @@ func validatePeerName(name string) error {
 	return nil
 }
 
-// encryptionKey derives a key from the database path for credential encryption.
-// This provides basic protection - credentials are not stored in plaintext.
-// For production, consider using system keyring or external secret managers.
-func (s *DoltStore) encryptionKey() []byte {
-	// Use SHA-256 hash of the database path as the key (32 bytes for AES-256)
-	// This ties credentials to this specific database location
+// keyFilePath returns the path to the encryption key file.
+// The key is stored in the parent directory of the Dolt database directory
+// (typically the .beads directory).
+func (s *DoltStore) keyFilePath() string {
+	return filepath.Join(filepath.Dir(s.dbPath), ".encryption_key")
+}
+
+// legacyEncryptionKey derives a key using the old path-based method.
+// Used only during migration from the legacy key derivation.
+func (s *DoltStore) legacyEncryptionKey() []byte {
 	h := sha256.New()
 	h.Write([]byte(s.dbPath + "beads-federation-key-v1"))
 	return h.Sum(nil)
 }
 
-// encryptPassword encrypts a password using AES-GCM
-func (s *DoltStore) encryptPassword(password string) ([]byte, error) {
-	if password == "" {
-		return nil, nil
+// encryptionKey returns the AES-256 encryption key, loading from file or generating a new one.
+// The key is a random 32-byte value stored in a file with restrictive permissions (0600).
+// The key is cached in memory after first load.
+func (s *DoltStore) encryptionKey() ([]byte, error) {
+	if s.encKey != nil {
+		return s.encKey, nil
 	}
 
-	block, err := aes.NewCipher(s.encryptionKey())
+	keyPath := s.keyFilePath()
+
+	// Try to read existing key file
+	data, err := os.ReadFile(keyPath)
+	if err == nil && len(data) == 32 {
+		s.encKey = data
+		return data, nil
+	}
+
+	// Generate new random key
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, fmt.Errorf("failed to generate encryption key: %w", err)
+	}
+
+	// Write key file with restrictive permissions (owner read/write only)
+	if err := os.WriteFile(keyPath, key, 0600); err != nil {
+		return nil, fmt.Errorf("failed to write encryption key file %s: %w", keyPath, err)
+	}
+
+	s.encKey = key
+	return key, nil
+}
+
+// migrateEncryptionKey migrates from the legacy path-derived key to a random key file.
+// Called during store initialization. If a key file already exists, this is a no-op.
+func (s *DoltStore) migrateEncryptionKey(ctx context.Context) error {
+	keyPath := s.keyFilePath()
+
+	// If key file already exists, just load it
+	if _, err := os.Stat(keyPath); err == nil {
+		_, loadErr := s.encryptionKey()
+		return loadErr
+	}
+
+	// Check if there are existing encrypted credentials to migrate
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM federation_peers WHERE password_encrypted IS NOT NULL AND LENGTH(password_encrypted) > 0",
+	).Scan(&count)
+	if err != nil {
+		// Table doesn't exist yet — no migration needed, just generate key
+		_, genErr := s.encryptionKey()
+		return genErr
+	}
+
+	if count == 0 {
+		// No existing encrypted credentials — just generate the new key
+		_, genErr := s.encryptionKey()
+		return genErr
+	}
+
+	// Decrypt existing credentials with legacy key
+	oldKey := s.legacyEncryptionKey()
+
+	rows, err := s.queryContext(ctx,
+		"SELECT name, password_encrypted FROM federation_peers WHERE password_encrypted IS NOT NULL AND LENGTH(password_encrypted) > 0",
+	)
+	if err != nil {
+		return fmt.Errorf("encryption key migration: failed to read credentials: %w", err)
+	}
+	defer rows.Close()
+
+	type migCred struct {
+		name     string
+		password string
+	}
+	var creds []migCred
+
+	for rows.Next() {
+		var name string
+		var encrypted []byte
+		if err := rows.Scan(&name, &encrypted); err != nil {
+			return fmt.Errorf("encryption key migration: failed to scan credential: %w", err)
+		}
+		password, err := decryptWithKey(encrypted, oldKey)
+		if err != nil {
+			// Legacy decryption failed — skip this credential (may be corrupted).
+			// The user can re-add the peer to re-encrypt with the new key.
+			continue
+		}
+		creds = append(creds, migCred{name: name, password: password})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("encryption key migration: failed to iterate credentials: %w", err)
+	}
+
+	// Generate and save new random key
+	newKey, err := s.encryptionKey()
+	if err != nil {
+		return err
+	}
+
+	// Re-encrypt all credentials with new key
+	for _, c := range creds {
+		encrypted, err := encryptWithKey([]byte(c.password), newKey)
+		if err != nil {
+			return fmt.Errorf("encryption key migration: failed to re-encrypt credential for %s: %w", c.name, err)
+		}
+		_, err = s.execContext(ctx,
+			"UPDATE federation_peers SET password_encrypted = ? WHERE name = ?",
+			encrypted, c.name,
+		)
+		if err != nil {
+			return fmt.Errorf("encryption key migration: failed to update credential for %s: %w", c.name, err)
+		}
+	}
+
+	return nil
+}
+
+// encryptWithKey encrypts plaintext using AES-GCM with the given key.
+func encryptWithKey(plaintext, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
@@ -73,17 +193,12 @@ func (s *DoltStore) encryptPassword(password string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	ciphertext := gcm.Seal(nonce, nonce, []byte(password), nil)
-	return ciphertext, nil
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
 }
 
-// decryptPassword decrypts a password using AES-GCM
-func (s *DoltStore) decryptPassword(encrypted []byte) (string, error) {
-	if len(encrypted) == 0 {
-		return "", nil
-	}
-
-	block, err := aes.NewCipher(s.encryptionKey())
+// decryptWithKey decrypts ciphertext using AES-GCM with the given key.
+func decryptWithKey(encrypted, key []byte) (string, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("failed to create cipher: %w", err)
 	}
@@ -105,6 +220,34 @@ func (s *DoltStore) decryptPassword(encrypted []byte) (string, error) {
 	}
 
 	return string(plaintext), nil
+}
+
+// encryptPassword encrypts a password using AES-GCM with the installation's key.
+func (s *DoltStore) encryptPassword(password string) ([]byte, error) {
+	if password == "" {
+		return nil, nil
+	}
+
+	key, err := s.encryptionKey()
+	if err != nil {
+		return nil, err
+	}
+
+	return encryptWithKey([]byte(password), key)
+}
+
+// decryptPassword decrypts a password using AES-GCM with the installation's key.
+func (s *DoltStore) decryptPassword(encrypted []byte) (string, error) {
+	if len(encrypted) == 0 {
+		return "", nil
+	}
+
+	key, err := s.encryptionKey()
+	if err != nil {
+		return "", err
+	}
+
+	return decryptWithKey(encrypted, key)
 }
 
 // AddFederationPeer adds or updates a federation peer with credentials.
