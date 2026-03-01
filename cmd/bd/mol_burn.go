@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -381,22 +382,29 @@ func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, forc
 	deleteBatch(nil, issueIDs, true, false, false, jsonOutput, false, "mol burn")
 }
 
-// burnWisps deletes all wisp issues without creating a digest
-//
-//nolint:unparam // error return kept for future use and consistent API
+// burnWisps deletes all wisp issues atomically within a single transaction.
+// If any delete fails, the entire operation is rolled back to prevent partial burns.
 func burnWisps(ctx context.Context, s *dolt.DoltStore, ids []string) (*BurnResult, error) {
 	result := &BurnResult{
 		DeletedIDs: make([]string, 0, len(ids)),
 	}
 
-	for _, id := range ids {
-		if err := s.DeleteIssue(ctx, id); err != nil {
-			// Log but continue - try to delete as many as possible
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", id, err)
-			continue
+	if len(ids) == 0 {
+		return result, nil
+	}
+
+	err := transact(ctx, s, fmt.Sprintf("bd: burn %d wisps", len(ids)), func(tx storage.Transaction) error {
+		for _, id := range ids {
+			if err := tx.DeleteIssue(ctx, id); err != nil {
+				return fmt.Errorf("failed to delete %s: %w", id, err)
+			}
+			result.DeletedIDs = append(result.DeletedIDs, id)
+			result.DeletedCount++
 		}
-		result.DeletedIDs = append(result.DeletedIDs, id)
-		result.DeletedCount++
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return result, nil
