@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -103,6 +104,8 @@ type DoltStore struct {
 	branch         string // Current branch
 	remoteUser     string // Remote auth user for Hosted Dolt push/pull (optional)
 	remotePassword string // Remote auth password for Hosted Dolt push/pull (optional)
+
+	encKey []byte // Cached encryption key for credential storage (loaded from file)
 }
 
 // Config holds Dolt database configuration
@@ -680,6 +683,14 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	// All writers operate on main — transaction isolation via RunInTransaction
 	// replaces the former branch-per-polecat approach (BD_BRANCH).
 	store.branch = "main"
+
+	// Initialize encryption key for credential storage (generates key file if needed,
+	// migrates existing credentials from old derivation-based key).
+	if !cfg.ReadOnly {
+		if err := store.initEncryptionKey(ctx); err != nil {
+			log.Printf("warning: encryption key initialization failed: %v", err)
+		}
+	}
 
 	return store, nil
 }

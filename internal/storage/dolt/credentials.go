@@ -9,7 +9,9 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -41,15 +43,169 @@ func validatePeerName(name string) error {
 	return nil
 }
 
-// encryptionKey derives a key from the database path for credential encryption.
-// This provides basic protection - credentials are not stored in plaintext.
-// For production, consider using system keyring or external secret managers.
-func (s *DoltStore) encryptionKey() []byte {
-	// Use SHA-256 hash of the database path as the key (32 bytes for AES-256)
-	// This ties credentials to this specific database location
+// encryptionKeyPath returns the path to the encryption key file.
+// The key file is stored alongside the database in its parent directory (.beads/).
+func (s *DoltStore) encryptionKeyPath() string {
+	return filepath.Join(filepath.Dir(s.dbPath), ".encryption_key")
+}
+
+// legacyEncryptionKey derives the old predictable key from dbPath (for migration only).
+func (s *DoltStore) legacyEncryptionKey() []byte {
 	h := sha256.New()
 	h.Write([]byte(s.dbPath + "beads-federation-key-v1"))
 	return h.Sum(nil)
+}
+
+// encryptionKey returns the cached encryption key for credential storage.
+// The key is loaded from a file during initialization.
+func (s *DoltStore) encryptionKey() ([]byte, error) {
+	if s.encKey != nil {
+		return s.encKey, nil
+	}
+	// Fallback: load from file if not yet cached (shouldn't happen after init)
+	key, err := os.ReadFile(s.encryptionKeyPath())
+	if err != nil {
+		return nil, fmt.Errorf("encryption key not available: %w", err)
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("encryption key file has invalid length %d (expected 32)", len(key))
+	}
+	s.encKey = key
+	return key, nil
+}
+
+// initEncryptionKey loads or generates the encryption key file and migrates
+// any existing credentials from the old derivation-based key.
+func (s *DoltStore) initEncryptionKey(ctx context.Context) error {
+	keyPath := s.encryptionKeyPath()
+
+	// Try to load existing key file
+	key, err := os.ReadFile(keyPath)
+	if err == nil && len(key) == 32 {
+		s.encKey = key
+		return nil
+	}
+
+	// Generate a new random key
+	key = make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return fmt.Errorf("failed to generate encryption key: %w", err)
+	}
+
+	// Check if there are existing credentials that need re-encryption
+	if err := s.migrateCredentialKeys(ctx, key); err != nil {
+		log.Printf("warning: credential key migration failed: %v", err)
+		// Continue — we still want to write the new key file so future
+		// credentials use the random key. Existing ones may need manual re-entry.
+	}
+
+	// Write the key file with restrictive permissions
+	if err := os.WriteFile(keyPath, key, 0600); err != nil {
+		return fmt.Errorf("failed to write encryption key file: %w", err)
+	}
+
+	s.encKey = key
+	return nil
+}
+
+// migrateCredentialKeys re-encrypts existing federation peer passwords
+// from the old derivation-based key to the new random key.
+func (s *DoltStore) migrateCredentialKeys(ctx context.Context, newKey []byte) error {
+	oldKey := s.legacyEncryptionKey()
+
+	rows, err := s.queryContext(ctx, `
+		SELECT name, password_encrypted FROM federation_peers
+		WHERE password_encrypted IS NOT NULL AND LENGTH(password_encrypted) > 0
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to query federation peers: %w", err)
+	}
+	defer rows.Close()
+
+	type peerCred struct {
+		name         string
+		encryptedPwd []byte
+	}
+	var creds []peerCred
+
+	for rows.Next() {
+		var c peerCred
+		if err := rows.Scan(&c.name, &c.encryptedPwd); err != nil {
+			return fmt.Errorf("failed to scan peer: %w", err)
+		}
+		creds = append(creds, c)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(creds) == 0 {
+		return nil
+	}
+
+	// Re-encrypt each credential: decrypt with old key, encrypt with new key
+	for _, c := range creds {
+		// Decrypt with old key
+		plaintext, err := decryptWithKey(c.encryptedPwd, oldKey)
+		if err != nil {
+			log.Printf("warning: could not decrypt credential for peer %q during migration (may need manual re-entry): %v", c.name, err)
+			continue
+		}
+
+		// Encrypt with new key
+		newEncrypted, err := encryptWithKey([]byte(plaintext), newKey)
+		if err != nil {
+			return fmt.Errorf("failed to re-encrypt credential for peer %q: %w", c.name, err)
+		}
+
+		// Update in database
+		_, err = s.execContext(ctx, `UPDATE federation_peers SET password_encrypted = ? WHERE name = ?`, newEncrypted, c.name)
+		if err != nil {
+			return fmt.Errorf("failed to update credential for peer %q: %w", c.name, err)
+		}
+	}
+
+	log.Printf("migrated %d federation peer credentials to random encryption key", len(creds))
+	return nil
+}
+
+// encryptWithKey encrypts plaintext using AES-GCM with the given key.
+func encryptWithKey(plaintext, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("failed to generate nonce: %w", err)
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// decryptWithKey decrypts ciphertext using AES-GCM with the given key.
+func decryptWithKey(encrypted, key []byte) (string, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("failed to create cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("failed to create GCM: %w", err)
+	}
+	nonceSize := gcm.NonceSize()
+	if len(encrypted) < nonceSize {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	nonce, ciphertext := encrypted[:nonceSize], encrypted[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt: %w", err)
+	}
+	return string(plaintext), nil
 }
 
 // encryptPassword encrypts a password using AES-GCM
@@ -58,23 +214,11 @@ func (s *DoltStore) encryptPassword(password string) ([]byte, error) {
 		return nil, nil
 	}
 
-	block, err := aes.NewCipher(s.encryptionKey())
+	key, err := s.encryptionKey()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
+		return nil, err
 	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
-	ciphertext := gcm.Seal(nonce, nonce, []byte(password), nil)
-	return ciphertext, nil
+	return encryptWithKey([]byte(password), key)
 }
 
 // decryptPassword decrypts a password using AES-GCM
@@ -83,28 +227,11 @@ func (s *DoltStore) decryptPassword(encrypted []byte) (string, error) {
 		return "", nil
 	}
 
-	block, err := aes.NewCipher(s.encryptionKey())
+	key, err := s.encryptionKey()
 	if err != nil {
-		return "", fmt.Errorf("failed to create cipher: %w", err)
+		return "", err
 	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(encrypted) < nonceSize {
-		return "", fmt.Errorf("ciphertext too short")
-	}
-
-	nonce, ciphertext := encrypted[:nonceSize], encrypted[nonceSize:]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to decrypt: %w", err)
-	}
-
-	return string(plaintext), nil
+	return decryptWithKey(encrypted, key)
 }
 
 // AddFederationPeer adds or updates a federation peer with credentials.
