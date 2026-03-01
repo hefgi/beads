@@ -669,6 +669,123 @@ func TestClosePromotedWisp(t *testing.T) {
 	}
 }
 
+// TestUpdateIssueIDUpdatesWispTables verifies that UpdateIssueID correctly
+// updates wisp tables (wisps, wisp_events, wisp_labels, wisp_comments,
+// wisp_dependencies) when renaming a wisp. Previously, UpdateIssueID only
+// updated the issues-side tables, leaving wisp references stale (bd-8ykk).
+func TestUpdateIssueIDUpdatesWispTables(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create a wisp with events, labels, and comments
+	wisp := &types.Issue{
+		Title:     "Wisp to rename",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.createWisp(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("createWisp failed: %v", err)
+	}
+	oldID := wisp.ID
+	if !IsEphemeralID(oldID) {
+		t.Fatalf("expected wisp ID to match ephemeral pattern, got %q", oldID)
+	}
+
+	// Add a label to the wisp
+	if err := store.addWispLabel(ctx, oldID, "test-label", "tester"); err != nil {
+		t.Fatalf("addWispLabel failed: %v", err)
+	}
+
+	// Verify initial state: wisp_events should have events for oldID
+	// (1 created event + 1 label_added event)
+	var oldEventCount int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM wisp_events WHERE issue_id = ?`, oldID).Scan(&oldEventCount); err != nil {
+		t.Fatalf("failed to count wisp_events: %v", err)
+	}
+	if oldEventCount != 2 {
+		t.Fatalf("expected 2 wisp_events for old ID, got %d", oldEventCount)
+	}
+
+	// Rename the wisp
+	newID := oldID + "-renamed"
+	wisp.ID = newID
+	if err := store.UpdateIssueID(ctx, oldID, newID, wisp, "tester"); err != nil {
+		t.Fatalf("UpdateIssueID failed: %v", err)
+	}
+
+	// Verify wisps table: old ID gone, new ID present
+	var wispCount int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM wisps WHERE id = ?`, oldID).Scan(&wispCount); err != nil {
+		t.Fatalf("failed to count wisps with old ID: %v", err)
+	}
+	if wispCount != 0 {
+		t.Errorf("expected 0 wisps with old ID, got %d", wispCount)
+	}
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM wisps WHERE id = ?`, newID).Scan(&wispCount); err != nil {
+		t.Fatalf("failed to count wisps with new ID: %v", err)
+	}
+	if wispCount != 1 {
+		t.Errorf("expected 1 wisp with new ID, got %d", wispCount)
+	}
+
+	// Verify wisp_events: all events should reference the new ID
+	var newEventCount int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM wisp_events WHERE issue_id = ?`, newID).Scan(&newEventCount); err != nil {
+		t.Fatalf("failed to count wisp_events with new ID: %v", err)
+	}
+	// 2 original events (created + label_added) + 1 renamed event = 3
+	if newEventCount != 3 {
+		t.Errorf("expected 3 wisp_events for new ID, got %d", newEventCount)
+	}
+
+	// No events should remain with the old ID
+	var staleEventCount int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM wisp_events WHERE issue_id = ?`, oldID).Scan(&staleEventCount); err != nil {
+		t.Fatalf("failed to count stale wisp_events: %v", err)
+	}
+	if staleEventCount != 0 {
+		t.Errorf("expected 0 wisp_events with old ID, got %d", staleEventCount)
+	}
+
+	// Verify wisp_labels: label should reference the new ID
+	var labelCount int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM wisp_labels WHERE issue_id = ?`, newID).Scan(&labelCount); err != nil {
+		t.Fatalf("failed to count wisp_labels with new ID: %v", err)
+	}
+	if labelCount != 1 {
+		t.Errorf("expected 1 wisp_label for new ID, got %d", labelCount)
+	}
+	var staleLabelCount int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM wisp_labels WHERE issue_id = ?`, oldID).Scan(&staleLabelCount); err != nil {
+		t.Fatalf("failed to count stale wisp_labels: %v", err)
+	}
+	if staleLabelCount != 0 {
+		t.Errorf("expected 0 wisp_labels with old ID, got %d", staleLabelCount)
+	}
+
+	// Verify the regular events table was NOT touched
+	var regularEventCount int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events WHERE issue_id = ? OR issue_id = ?`, oldID, newID).Scan(&regularEventCount); err != nil {
+		t.Fatalf("failed to count regular events: %v", err)
+	}
+	if regularEventCount != 0 {
+		t.Errorf("expected 0 regular events for wisp IDs, got %d", regularEventCount)
+	}
+}
+
 func TestDoltStoreLabels(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
